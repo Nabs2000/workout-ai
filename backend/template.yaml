@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: FitCoach AI — Workout tracking app powered by Amazon Nova
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 120
+    MemorySize: 512
+    CodeUri: ./
+    Handler: dist/handlers/router.handler
+    Environment:
+      Variables:
+        USERS_TABLE: !Ref UsersTable
+        PLANS_TABLE: !Ref PlansTable
+        LOGS_TABLE: !Ref LogsTable
+        ANALYSES_TABLE: !Ref AnalysesTable
+        NOVA_MODEL_ID: amazon.nova-lite-v1:0
+        REGION: !Ref AWS::Region
+    Layers:
+      - !Ref DepsLayer
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+
+# ─── API Gateway ──────────────────────────────────────────────────────────────
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Stage
+      Cors:
+        AllowMethods: "'*'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+
+  # ─── Lambda Functions ────────────────────────────────────────────────────────
+
+  UsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/handlers/users.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        CreateUser:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /users
+            Method: POST
+        GetUser:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /users/{userId}
+            Method: GET
+
+  PlansFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/handlers/plans.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PlansTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-pro-v1:0
+      Events:
+        GeneratePlan:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /plans/generate
+            Method: POST
+        GetCurrentPlan:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /plans/current/{userId}
+            Method: GET
+        GetPlanByWeek:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /plans/{userId}/{year}/{weekNumber}
+            Method: GET
+
+  LogsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/handlers/logs.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LogsTable
+      Events:
+        CreateLog:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /logs
+            Method: POST
+        GetLogsByWeek:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /logs/{userId}/{year}/{weekNumber}
+            Method: GET
+        GetRecentLogs:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /logs/{userId}/recent
+            Method: GET
+
+  AnalyzeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/handlers/analyze.handler
+      Timeout: 180
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AnalysesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PlansTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref LogsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-pro-v1:0
+      Events:
+        RunWeeklyAnalysis:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /analyze/weekly
+            Method: POST
+        GetLatestAnalysis:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /analyze/{userId}/latest
+            Method: GET
+
+  ProgressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/handlers/progress.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref LogsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AnalysesTable
+      Events:
+        GetProgress:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /progress/{userId}
+            Method: GET
+
+  DepsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: nodejs/
+      CompatibleRuntimes:
+        - nodejs20.x
+    Metadata:
+      BuildMethod: nodejs20.x
+
+  # ─── DynamoDB Tables ──────────────────────────────────────────────────────────
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub fitcoach-users-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  PlansTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub fitcoach-plans-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: planId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: planId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: UserWeekIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: planId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  LogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub fitcoach-logs-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: logId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: logId
+          KeyType: RANGE
+
+  AnalysesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub fitcoach-analyses-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: analysisId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: analysisId
+          KeyType: RANGE
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+  ApiUrl:
+    Description: API Gateway URL — paste this into your frontend .env
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
